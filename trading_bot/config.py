@@ -4,6 +4,16 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any
 
 
+BASE_CANDLE_INTERVAL_MS = 5 * 60 * 1000
+
+
+def scale_bar_count(base_bars: int, candle_interval_ms: int, minimum: int = 1) -> int:
+    if candle_interval_ms <= 0:
+        raise ValueError("Candle interval must be positive.")
+    scaled = int(round(base_bars * BASE_CANDLE_INTERVAL_MS / candle_interval_ms))
+    return max(minimum, scaled)
+
+
 @dataclass(frozen=True)
 class FeeModel:
     spot_fee_rate: float = 0.005
@@ -63,7 +73,27 @@ class ResearchConfig:
         return asdict(self)
 
 
-def candidate_parameters(base: StrategyParameters) -> list[StrategyParameters]:
+def scale_strategy_parameters(parameters: StrategyParameters, candle_interval_ms: int) -> StrategyParameters:
+    return replace(
+        parameters,
+        horizon_bars=scale_bar_count(parameters.horizon_bars, candle_interval_ms, minimum=1),
+        max_hold_bars=scale_bar_count(parameters.max_hold_bars, candle_interval_ms, minimum=1),
+        cooldown_bars=scale_bar_count(parameters.cooldown_bars, candle_interval_ms, minimum=0),
+    )
+
+
+def scale_research_config(config: ResearchConfig, candle_interval_ms: int) -> ResearchConfig:
+    return replace(
+        config,
+        recent_candle_buffer=scale_bar_count(config.recent_candle_buffer, candle_interval_ms, minimum=8),
+        minimum_training_rows=scale_bar_count(config.minimum_training_rows, candle_interval_ms, minimum=32),
+    )
+
+
+def candidate_parameters(
+    base: StrategyParameters,
+    candle_interval_ms: int = BASE_CANDLE_INTERVAL_MS,
+) -> list[StrategyParameters]:
     profiles = (
         {},
         {
@@ -180,7 +210,7 @@ def candidate_parameters(base: StrategyParameters) -> list[StrategyParameters]:
     seen: set[tuple[Any, ...]] = set()
     variants: list[StrategyParameters] = []
     for profile in profiles:
-        candidate = replace(base, **profile)
+        candidate = scale_strategy_parameters(replace(base, **profile), candle_interval_ms)
         fingerprint = tuple(candidate.to_dict().items())
         if fingerprint in seen:
             continue

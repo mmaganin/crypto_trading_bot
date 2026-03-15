@@ -7,8 +7,17 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .config import FeeModel, ResearchConfig, StrategyParameters, candidate_parameters
-from .data import FEATURE_COLUMNS, attach_targets, compute_feature_frame, split_dataset
+from .config import FeeModel, ResearchConfig, StrategyParameters, candidate_parameters, scale_research_config
+from .data import (
+    CandleInterval,
+    FEATURE_COLUMNS,
+    attach_targets,
+    compute_feature_frame,
+    format_candle_interval,
+    infer_candle_interval,
+    load_candles,
+    split_dataset,
+)
 from .model import IncrementalDirectionalModel, ModelPrediction
 from .portfolio import PendingOrder, Portfolio
 
@@ -23,6 +32,7 @@ class SimulationResult:
     recent_candles: pd.DataFrame
     last_trained_timestamp_ms: int
     evaluation_name: str
+    candle_interval_ms: int
 
 
 def run_research_pipeline(
@@ -31,11 +41,17 @@ def run_research_pipeline(
     research_config: ResearchConfig,
     base_strategy_parameters: StrategyParameters,
 ) -> dict[str, Any]:
-    feature_frame = compute_feature_frame(candles)
-    splits = split_dataset(len(feature_frame), research_config.train_ratio, research_config.validation_ratio)
+    candle_interval = infer_candle_interval(candles)
+    scaled_research_config = scale_research_config(research_config, candle_interval.milliseconds)
+    feature_frame = compute_feature_frame(candles, candle_interval)
+    splits = split_dataset(
+        len(feature_frame),
+        scaled_research_config.train_ratio,
+        scaled_research_config.validation_ratio,
+    )
 
     validation_results: list[SimulationResult] = []
-    for candidate in candidate_parameters(base_strategy_parameters):
+    for candidate in candidate_parameters(base_strategy_parameters, candle_interval.milliseconds):
         candidate_dataset = attach_targets(
             feature_frame,
             horizon_bars=candidate.horizon_bars,
@@ -45,11 +61,12 @@ def run_research_pipeline(
             simulate_walk_forward(
                 dataset=candidate_dataset,
                 fee_model=fee_model,
-                research_config=research_config,
+                research_config=scaled_research_config,
                 strategy_parameters=candidate,
                 evaluation_start=splits.validation_start,
                 evaluation_end=splits.validation_end,
                 evaluation_name="validation",
+                candle_interval=candle_interval,
             )
         )
 
@@ -63,16 +80,18 @@ def run_research_pipeline(
     test_result = simulate_walk_forward(
         dataset=test_dataset,
         fee_model=fee_model,
-        research_config=research_config,
+        research_config=scaled_research_config,
         strategy_parameters=best_validation.strategy_parameters,
         evaluation_start=splits.test_start,
         evaluation_end=len(test_dataset),
         evaluation_name="test",
+        candle_interval=candle_interval,
     )
     trained_model, training_state = fit_model_on_full_history(
         dataset=test_dataset,
         strategy_parameters=best_validation.strategy_parameters,
-        recent_candle_buffer=research_config.recent_candle_buffer,
+        recent_candle_buffer=scaled_research_config.recent_candle_buffer,
+        candle_interval=candle_interval,
     )
     return {
         "validation": best_validation,
@@ -83,6 +102,8 @@ def run_research_pipeline(
             last_trained_timestamp_ms=training_state["last_trained_timestamp_ms"],
         ),
         "best_strategy_parameters": best_validation.strategy_parameters,
+        "research_config": scaled_research_config,
+        "candle_interval": candle_interval,
     }
 
 
@@ -94,6 +115,7 @@ def simulate_walk_forward(
     evaluation_start: int,
     evaluation_end: int,
     evaluation_name: str,
+    candle_interval: CandleInterval,
 ) -> SimulationResult:
     features = dataset[FEATURE_COLUMNS].to_numpy(dtype=float)
     labels = dataset["label"].to_numpy(dtype=np.int64)
@@ -203,9 +225,12 @@ def simulate_walk_forward(
         trades=trades,
         starting_cash=research_config.starting_cash,
         total_fees_paid=portfolio.total_fees_paid,
+        bars_per_year=candle_interval.bars_per_year,
     )
     metrics["evaluation_name"] = evaluation_name
     metrics["strategy_parameters"] = strategy_parameters.to_dict()
+    metrics["candle_interval_ms"] = candle_interval.milliseconds
+    metrics["candle_interval"] = candle_interval.label
 
     return SimulationResult(
         metrics=metrics,
@@ -216,6 +241,7 @@ def simulate_walk_forward(
         recent_candles=dataset.tail(research_config.recent_candle_buffer).copy(),
         last_trained_timestamp_ms=int(dataset.loc[label_mask, "timestamp_ms"].max()),
         evaluation_name=evaluation_name,
+        candle_interval_ms=candle_interval.milliseconds,
     )
 
 
@@ -223,6 +249,7 @@ def fit_model_on_full_history(
     dataset: pd.DataFrame,
     strategy_parameters: StrategyParameters,
     recent_candle_buffer: int,
+    candle_interval: CandleInterval,
 ) -> tuple[IncrementalDirectionalModel, dict[str, Any]]:
     features = dataset[FEATURE_COLUMNS].to_numpy(dtype=float)
     labels = dataset["label"].to_numpy(dtype=np.int64)
@@ -233,6 +260,8 @@ def fit_model_on_full_history(
     training_state = {
         "recent_candles": dataset.tail(recent_candle_buffer).copy(),
         "last_trained_timestamp_ms": int(dataset.loc[label_mask, "timestamp_ms"].max()),
+        "candle_interval_ms": candle_interval.milliseconds,
+        "candle_interval": candle_interval.label,
     }
     return model, training_state
 
@@ -265,6 +294,8 @@ def save_simulation_outputs(
             "last_trained_timestamp_ms": simulation_result.last_trained_timestamp_ms,
             "research_config": research_config.to_dict(),
             "fee_model": asdict(fee_model),
+            "candle_interval_ms": simulation_result.candle_interval_ms,
+            "candle_interval": format_candle_interval(simulation_result.candle_interval_ms),
         },
     )
     return {
@@ -280,19 +311,23 @@ def update_model_from_new_candles(
     candle_csv_path: str | Path,
     recent_candle_buffer: int = 500,
 ) -> dict[str, Any]:
-    from .data import load_candles
-
     model, extra_state = IncrementalDirectionalModel.load(state_path)
     historic_tail = pd.DataFrame(extra_state["recent_candles"])
+    expected_interval = _resolve_candle_interval(extra_state, historic_tail)
     new_candles = load_candles(candle_csv_path)
+
+    if len(new_candles) >= 2:
+        infer_candle_interval(new_candles, expected_interval_ms=expected_interval.milliseconds)
+
     combined = (
         pd.concat([historic_tail, new_candles], ignore_index=True)
         .sort_values("timestamp_ms")
         .drop_duplicates(subset="timestamp_ms", keep="last")
         .reset_index(drop=True)
     )
+    combined_interval = infer_candle_interval(combined, expected_interval_ms=expected_interval.milliseconds)
     dataset = attach_targets(
-        compute_feature_frame(combined),
+        compute_feature_frame(combined, combined_interval),
         horizon_bars=model.strategy_parameters.horizon_bars,
         label_return_threshold=model.strategy_parameters.label_return_threshold,
     )
@@ -307,18 +342,22 @@ def update_model_from_new_candles(
         model.update(feature_vector, int(row["label"]), float(row["future_return"]))
 
     new_last_trained = int(dataset.loc[label_mask, "timestamp_ms"].max())
+    scaled_recent_candle_buffer = max(8, recent_candle_buffer)
     model.save(
         state_path,
         extra_state={
             **extra_state,
-            "recent_candles": dataset.tail(recent_candle_buffer).to_dict(orient="records"),
+            "recent_candles": dataset.tail(scaled_recent_candle_buffer).to_dict(orient="records"),
             "last_trained_timestamp_ms": new_last_trained,
+            "candle_interval_ms": expected_interval.milliseconds,
+            "candle_interval": expected_interval.label,
         },
     )
     return {
         "updated_rows": update_count,
         "last_trained_timestamp_ms": new_last_trained,
         "state_path": str(state_path),
+        "candle_interval": expected_interval.label,
     }
 
 
@@ -472,6 +511,7 @@ def calculate_metrics(
     trades: pd.DataFrame,
     starting_cash: float,
     total_fees_paid: float,
+    bars_per_year: float,
 ) -> dict[str, Any]:
     if equity_curve.empty:
         return {
@@ -496,7 +536,7 @@ def calculate_metrics(
     ending_equity = float(equity_curve["equity"].iloc[-1])
     total_return_pct = (ending_equity / starting_cash - 1.0) * 100.0
     sharpe_denominator = float(equity_curve["return"].std())
-    annualization_factor = np.sqrt(12 * 24 * 365)
+    annualization_factor = np.sqrt(bars_per_year)
     sharpe_ratio = (
         float(equity_curve["return"].mean()) / sharpe_denominator * annualization_factor
         if sharpe_denominator > 0.0
@@ -540,3 +580,18 @@ def json_dumps(payload: dict[str, Any]) -> str:
     import json
 
     return json.dumps(payload, indent=2, default=str)
+
+
+def _resolve_candle_interval(extra_state: dict[str, Any], historic_tail: pd.DataFrame) -> CandleInterval:
+    interval_ms = extra_state.get("candle_interval_ms")
+    if interval_ms is None:
+        interval_label = extra_state.get("candle_interval")
+        if isinstance(interval_label, str) and interval_label.endswith("m"):
+            interval_ms = int(interval_label[:-1]) * 60 * 1000
+        elif isinstance(interval_label, str) and interval_label.endswith("h"):
+            interval_ms = int(interval_label[:-1]) * 60 * 60 * 1000
+
+    if interval_ms is None:
+        return infer_candle_interval(historic_tail)
+
+    return infer_candle_interval(historic_tail, expected_interval_ms=int(interval_ms))
