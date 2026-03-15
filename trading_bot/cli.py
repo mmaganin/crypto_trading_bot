@@ -18,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--csv",
         type=Path,
         default=Path("bitcoin_price_history_five_minute_candlesticks.csv"),
-        help="Path to the historical candle CSV.",
+        help="Path to a historical candle CSV with timestamp + OHLC columns and a regular interval of 4h or less.",
     )
     train_parser.add_argument(
         "--output-dir",
@@ -32,7 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Incrementally update an existing saved state with newly arrived candle data.",
     )
     update_parser.add_argument("--state", type=Path, default=Path("artifacts/bot_state.joblib"))
-    update_parser.add_argument("--csv", type=Path, required=True, help="CSV containing new candles to ingest.")
+    update_parser.add_argument(
+        "--csv",
+        type=Path,
+        required=True,
+        help="CSV containing new timestamp + OHLC candles to ingest at the same interval as the saved state.",
+    )
 
     return parser
 
@@ -54,11 +59,13 @@ def main() -> None:
         )
         best_validation = research_result["validation"]
         final_test = research_result["test"]
-        output_paths = save_simulation_outputs(args.output_dir, final_test, research_config, fee_model)
+        scaled_research_config = research_result["research_config"]
+        output_paths = save_simulation_outputs(args.output_dir, final_test, scaled_research_config, fee_model)
         summary = {
             "validation_metrics": best_validation.metrics,
             "test_metrics": final_test.metrics,
             "best_strategy_parameters": final_test.strategy_parameters.to_dict(),
+            "research_config": scaled_research_config.to_dict(),
             "artifacts": {name: str(path) for name, path in output_paths.items()},
         }
         print(json.dumps(summary, indent=2))
