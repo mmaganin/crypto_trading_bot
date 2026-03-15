@@ -62,6 +62,7 @@ class ResearchConfig:
     starting_cash: float = 10_000.0
     train_ratio: float = 0.60
     validation_ratio: float = 0.20
+    validation_folds: int = 3
     recent_candle_buffer: int = 500
     minimum_training_rows: int = 2_500
 
@@ -139,12 +140,32 @@ def candidate_parameters(
         {
             "horizon_bars": 576,
             "label_return_threshold": 0.0020,
+            "margin_threshold": 0.0010,
+            "spot_threshold": 0.0250,
+            "max_hold_bars": 576,
+            "stop_loss_atr_multiple": 2.0,
+            "take_profit_atr_multiple": 6.0,
+            "cooldown_bars": 120,
+        },
+        {
+            "horizon_bars": 576,
+            "label_return_threshold": 0.0020,
             "margin_threshold": 0.0012,
             "spot_threshold": 0.0280,
             "max_hold_bars": 576,
             "stop_loss_atr_multiple": 2.4,
             "take_profit_atr_multiple": 7.0,
             "cooldown_bars": 96,
+        },
+        {
+            "horizon_bars": 576,
+            "label_return_threshold": 0.0020,
+            "margin_threshold": 0.0012,
+            "spot_threshold": 0.0280,
+            "max_hold_bars": 576,
+            "stop_loss_atr_multiple": 2.4,
+            "take_profit_atr_multiple": 7.0,
+            "cooldown_bars": 120,
         },
         {
             "horizon_bars": 432,

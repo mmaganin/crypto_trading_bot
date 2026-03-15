@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from trading_bot.backtest import build_trade_proposal, update_model_from_new_candles
+from trading_bot.backtest import build_trade_proposal, build_validation_windows, update_model_from_new_candles
 from trading_bot.config import (
     FeeModel,
     ResearchConfig,
@@ -84,6 +84,36 @@ class TradingBotTests(unittest.TestCase):
         self.assertEqual(interval.milliseconds, 4 * 60 * 60 * 1000)
         self.assertTrue({"timestamp_ms", "open", "high", "low", "close"}.issubset(loaded.columns))
 
+    def test_load_candles_normalizes_spring_dst_wall_clock_gap(self) -> None:
+        opened_at = pd.Series(
+            [
+                "03/10/2024 01:45:00",
+                "03/10/2024 01:50:00",
+                "03/10/2024 01:55:00",
+                "03/10/2024 03:00:00",
+                "03/10/2024 03:05:00",
+                "03/10/2024 03:10:00",
+            ]
+        )
+        raw_frame = pd.DataFrame(
+            {
+                "readable_time_at_open": opened_at,
+                "open_price": [1, 2, 3, 4, 5, 6],
+                "highest_price": [2, 3, 4, 5, 6, 7],
+                "lowest_price": [0, 1, 2, 3, 4, 5],
+                "close_price": [1.5, 2.5, 3.5, 4.5, 5.5, 6.5],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            csv_path = Path(temp_dir) / "spring_dst.csv"
+            raw_frame.to_csv(csv_path, index=False)
+            loaded = load_candles(csv_path)
+
+        interval = infer_candle_interval(loaded)
+        self.assertEqual(interval.milliseconds, 5 * 60 * 1000)
+        self.assertTrue((loaded["timestamp_ms"].diff().dropna() == 5 * 60 * 1000).all())
+
     def test_rejects_candles_larger_than_four_hours(self) -> None:
         candles = synthetic_candles(rows=12, interval_ms=6 * 60 * 60 * 1000, include_optional=False)
         with self.assertRaisesRegex(ValueError, "four hours or smaller"):
@@ -99,6 +129,11 @@ class TradingBotTests(unittest.TestCase):
         self.assertEqual(scaled_strategy.cooldown_bars, 12)
         self.assertEqual(scaled_research.recent_candle_buffer, 42)
         self.assertEqual(scaled_research.minimum_training_rows, 208)
+
+    def test_validation_windows_cover_three_recent_pretest_folds(self) -> None:
+        research_config = ResearchConfig(minimum_training_rows=0)
+        windows = build_validation_windows(total_rows=1000, research_config=research_config)
+        self.assertEqual(windows, [(500, 600), (600, 700), (700, 800)])
 
     def test_incremental_model_round_trips_through_disk(self) -> None:
         candles = synthetic_candles()

@@ -11,6 +11,7 @@ from .config import scale_bar_count
 
 
 MAX_SUPPORTED_CANDLE_INTERVAL_MS = 4 * 60 * 60 * 1000
+SPRING_DST_SHIFT_MS = 60 * 60 * 1000
 
 RAW_TO_STANDARD_COLUMNS = {
     "open": "open",
@@ -348,8 +349,58 @@ def _coerce_timestamp_ms(values: pd.Series) -> pd.Series:
             scaled = numeric / 1_000_000.0
         return pd.Series(np.rint(scaled), index=values.index).astype("int64")
 
-    parsed = pd.to_datetime(values, utc=True, errors="coerce")
+    parsed = pd.to_datetime(values, errors="coerce")
     if parsed.isna().any():
         raise ValueError("Unable to parse candle timestamps.")
-    epoch = pd.Timestamp("1970-01-01", tz="UTC")
+
+    if parsed.dt.tz is not None:
+        epoch = pd.Timestamp("1970-01-01", tz="UTC")
+        utc_values = parsed.dt.tz_convert("UTC")
+        return ((utc_values - epoch) // pd.Timedelta(milliseconds=1)).astype("int64")
+
+    raw_ms = _naive_datetimes_to_ms(parsed)
+    if _timestamps_use_consistent_interval(raw_ms):
+        return raw_ms
+
+    adjusted_ms = _normalize_spring_dst_wall_clock(parsed)
+    if _timestamps_use_consistent_interval(adjusted_ms):
+        return adjusted_ms
+
+    return raw_ms
+
+
+def _naive_datetimes_to_ms(parsed: pd.Series) -> pd.Series:
+    epoch = pd.Timestamp("1970-01-01")
     return ((parsed - epoch) // pd.Timedelta(milliseconds=1)).astype("int64")
+
+
+def _timestamps_use_consistent_interval(timestamp_ms: pd.Series) -> bool:
+    ordered = (
+        pd.Series(timestamp_ms)
+        .dropna()
+        .astype("int64")
+        .sort_values()
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+    if len(ordered) < 2:
+        return True
+    deltas = ordered.diff().dropna().astype("int64")
+    return bool((deltas == int(deltas.iloc[0])).all())
+
+
+def _normalize_spring_dst_wall_clock(parsed: pd.Series) -> pd.Series:
+    corrections = pd.Series(0, index=parsed.index, dtype="int64")
+    years = pd.Series(parsed.dt.year.dropna().astype(int).unique()).sort_values().tolist()
+    for year in years:
+        transition = _us_spring_dst_transition(year)
+        corrections += (parsed >= transition).fillna(False).astype("int64")
+
+    adjusted = parsed - pd.to_timedelta(corrections * SPRING_DST_SHIFT_MS, unit="ms")
+    return _naive_datetimes_to_ms(adjusted)
+
+
+def _us_spring_dst_transition(year: int) -> pd.Timestamp:
+    march_eighth = pd.Timestamp(year=year, month=3, day=8, hour=3)
+    days_until_sunday = (6 - march_eighth.dayofweek) % 7
+    return march_eighth + pd.Timedelta(days=days_until_sunday)

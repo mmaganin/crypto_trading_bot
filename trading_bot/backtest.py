@@ -58,19 +58,26 @@ def run_research_pipeline(
             label_return_threshold=candidate.label_return_threshold,
         )
         validation_results.append(
-            simulate_walk_forward(
-                dataset=candidate_dataset,
-                fee_model=fee_model,
-                research_config=scaled_research_config,
-                strategy_parameters=candidate,
-                evaluation_start=splits.validation_start,
-                evaluation_end=splits.validation_end,
-                evaluation_name="validation",
-                candle_interval=candle_interval,
+            summarize_validation_results(
+                _run_validation_folds(
+                    dataset=candidate_dataset,
+                    fee_model=fee_model,
+                    research_config=scaled_research_config,
+                    strategy_parameters=candidate,
+                    candle_interval=candle_interval,
+                    total_rows=len(feature_frame),
+                )
             )
         )
 
-    best_validation = max(validation_results, key=lambda result: float(result.metrics["score"]))
+    best_validation = max(
+        validation_results,
+        key=lambda result: (
+            float(result.metrics["minimum_fold_return_pct"]),
+            float(result.metrics["average_fold_return_pct"]),
+            float(result.metrics["score"]),
+        ),
+    )
 
     test_dataset = attach_targets(
         feature_frame,
@@ -104,6 +111,87 @@ def run_research_pipeline(
         "best_strategy_parameters": best_validation.strategy_parameters,
         "research_config": scaled_research_config,
         "candle_interval": candle_interval,
+    }
+
+
+def _run_validation_folds(
+    dataset: pd.DataFrame,
+    fee_model: FeeModel,
+    research_config: ResearchConfig,
+    strategy_parameters: StrategyParameters,
+    candle_interval: CandleInterval,
+    total_rows: int,
+) -> list[SimulationResult]:
+    validation_windows = build_validation_windows(total_rows, research_config)
+    return [
+        simulate_walk_forward(
+            dataset=dataset,
+            fee_model=fee_model,
+            research_config=research_config,
+            strategy_parameters=strategy_parameters,
+            evaluation_start=window_start,
+            evaluation_end=window_end,
+            evaluation_name="validation",
+            candle_interval=candle_interval,
+        )
+        for window_start, window_end in validation_windows
+    ]
+
+
+def build_validation_windows(total_rows: int, research_config: ResearchConfig) -> list[tuple[int, int]]:
+    splits = split_dataset(total_rows, research_config.train_ratio, research_config.validation_ratio)
+    if research_config.validation_folds <= 1:
+        return [(splits.validation_start, splits.validation_end)]
+
+    fold_size = max(1, int(total_rows * research_config.validation_ratio / (research_config.validation_folds - 1)))
+    first_start = max(research_config.minimum_training_rows, splits.validation_start - fold_size)
+    windows: list[tuple[int, int]] = []
+    for fold_index in range(research_config.validation_folds):
+        window_start = first_start + fold_index * fold_size
+        window_end = window_start + fold_size
+        if window_end > splits.validation_end:
+            break
+        windows.append((window_start, window_end))
+
+    if not windows:
+        return [(splits.validation_start, splits.validation_end)]
+    return windows
+
+
+def summarize_validation_results(results: list[SimulationResult]) -> SimulationResult:
+    if not results:
+        raise ValueError("At least one validation result is required.")
+
+    aggregated_metrics = _aggregate_validation_metrics(results)
+    return replace(results[-1], metrics=aggregated_metrics)
+
+
+def _aggregate_validation_metrics(results: list[SimulationResult]) -> dict[str, Any]:
+    def average(metric_name: str) -> float:
+        return float(np.mean([float(result.metrics[metric_name]) for result in results]))
+
+    fold_returns = [float(result.metrics["total_return_pct"]) for result in results]
+
+    return {
+        "ending_equity": round(average("ending_equity"), 2),
+        "net_profit": round(average("net_profit"), 2),
+        "total_return_pct": round(average("total_return_pct"), 2),
+        "max_drawdown_pct": round(average("max_drawdown_pct"), 2),
+        "sharpe_ratio": round(average("sharpe_ratio"), 3),
+        "profit_factor": round(average("profit_factor"), 3),
+        "win_rate": round(average("win_rate"), 2),
+        "num_trades": int(round(average("num_trades"))),
+        "spot_trades": int(round(average("spot_trades"))),
+        "margin_trades": int(round(average("margin_trades"))),
+        "total_fees_paid": round(average("total_fees_paid"), 2),
+        "score": round(average("score"), 3),
+        "minimum_fold_return_pct": round(min(fold_returns), 2),
+        "average_fold_return_pct": round(float(np.mean(fold_returns)), 2),
+        "validation_folds": len(results),
+        "evaluation_name": "validation",
+        "strategy_parameters": results[-1].strategy_parameters.to_dict(),
+        "candle_interval_ms": results[-1].candle_interval_ms,
+        "candle_interval": format_candle_interval(results[-1].candle_interval_ms),
     }
 
 
@@ -386,6 +474,9 @@ def build_trade_proposal(
     if cash_available <= 0.0:
         return None
 
+    minimum_margin_edge = strategy_parameters.margin_threshold + fee_model.margin_round_trip
+    minimum_spot_edge = strategy_parameters.spot_threshold + fee_model.spot_round_trip
+
     bullish_score = sum(
         [
             rsi_14 >= 0.75,
@@ -418,7 +509,7 @@ def build_trade_proposal(
         bullish_score >= 7
         and ema_gap_288 > 0.0
         and trend_strength >= 0.015
-        and edge > fee_model.spot_round_trip
+        and edge >= minimum_spot_edge
         and prediction.probability_up >= strategy_parameters.spot_probability
     ):
         market = "spot"
@@ -427,6 +518,7 @@ def build_trade_proposal(
     elif (
         bullish_score >= 5
         and ema_gap_288 >= 0.0
+        and edge >= minimum_margin_edge
         and prediction.probability_up >= strategy_parameters.margin_probability
         and prediction.probability_down <= 0.45
     ):
@@ -436,7 +528,7 @@ def build_trade_proposal(
     elif (
         bearish_score >= 7
         and prediction.probability_down >= 0.60
-        and edge <= 0.0
+        and edge <= -minimum_margin_edge
     ):
         market = "margin"
         side = "short"
